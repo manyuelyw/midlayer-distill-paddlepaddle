@@ -1,19 +1,13 @@
-from x2paddle import torch2paddle
+import sys
+sys.path.append('/data2/fyzhai/paddle/paddle_project/utils')
+import paddle_aux
 import os
 import paddle
-import paddle.nn as nn
-import paddle.nn.functional as F
-from x2paddle.torch2paddle import DataLoader
+import paddlenlp
+from paddle.io import DataLoader
 import random
 import json
 import numpy
-from paddle.io import Dataset
-import paddle
-from paddle.nn import MSELoss
-from transformers import AutoTokenizer
-from transformers import AutoModelForCausalLM
-from transformers import AutoConfig
-from paddle.optimizer.lr import CosineAnnealingDecay
 import numpy as np
 import struct
 from itertools import accumulate
@@ -193,7 +187,7 @@ class DistributedMMapIndexedDataset(paddle.io.Dataset):
             data_file_path(path))
 
 
-class LMTrainDataset(Dataset):
+class LMTrainDataset(paddle.io.Dataset):
 
     def __init__(self, tokenizer, path, split, num, ratio, rng_sample:
         random.Random):
@@ -237,46 +231,46 @@ class LMTrainDataset(Dataset):
                 source_len + 1:]], axis=0)
         input_ids = input_ids[:self.max_length]
         input_len = len(input_ids)
-        model_data['input_ids'][i][:input_len - 1] = paddle.to_tensor(input_ids
-            [:-1], dtype=torch.long)
+        model_data['input_ids'][i][:input_len - 1] = paddle.to_tensor(data=
+            input_ids[:-1], dtype='int64')
         model_data['attention_mask'][i][:input_len - 1] = 1.0
-        model_data['position_ids'][i][:input_len - 1] = paddle.arange(0, 
-            input_len - 1, dtype=paddle.int64).requires_grad_(False)
-        no_model_data['label'][i][:input_len - 1] = paddle.to_tensor(input_ids
-            [1:], dtype=torch.long)
+        model_data['position_ids'][i][:input_len - 1] = paddle.arange(start
+            =0, end=input_len - 1, dtype='int64')
+        no_model_data['label'][i][:input_len - 1] = paddle.to_tensor(data=
+            input_ids[1:], dtype='int64')
         no_model_data['label'][i][:source_len - 1] = -100
         no_model_data['loss_mask'][i][:input_len - 1] = 1.0
         no_model_data['loss_mask'][i][:source_len - 1] = 0
         if prompt is not None:
-            gen_data['input_ids'][i][-len(prompt):] = paddle.to_tensor(prompt,
-                dtype=torch.long)
+            gen_data['input_ids'][i][-len(prompt):] = paddle.to_tensor(data
+                =prompt, dtype='int64')
             gen_data['attention_mask'][i][-len(prompt):] = 1.0
 
     def collate(self, samples):
         bs = len(samples)
         max_length = self.max_length
-        model_data = {'input_ids': paddle.ones([bs, max_length], dtype=\
-            paddle.int64).requires_grad_(False) * self.pad_id,
-            'attention_mask': paddle.zeros([bs, max_length]).requires_grad_
-            (False)}
-        model_data['position_ids'] = paddle.zeros([bs, max_length], dtype=\
-            paddle.int64).requires_grad_(False)
-        no_model_data = {'label': paddle.ones([bs, max_length], dtype=\
-            paddle.int64).requires_grad_(False) * -100, 'loss_mask': paddle
-            .zeros([bs, max_length]).requires_grad_(False)}
-        gen_data = {'input_ids': paddle.ones([bs, self.max_prompt_length],
-            dtype=paddle.int64).requires_grad_(False) * self.pad_id,
-            'attention_mask': paddle.zeros([bs, self.max_prompt_length],
-            dtype=paddle.int64).requires_grad_(False)}
+        model_data = {'input_ids': paddle.ones(shape=[bs, max_length],
+            dtype='int64') * self.pad_id, 'attention_mask': paddle.zeros(
+            shape=[bs, max_length])}
+        model_data['position_ids'] = paddle.zeros(shape=[bs, max_length],
+            dtype='int64')
+        no_model_data = {'label': paddle.ones(shape=[bs, max_length], dtype
+            ='int64') * -100, 'loss_mask': paddle.zeros(shape=[bs, max_length])
+            }
+        gen_data = {'input_ids': paddle.ones(shape=[bs, self.
+            max_prompt_length], dtype='int64') * self.pad_id,
+            'attention_mask': paddle.zeros(shape=[bs, self.
+            max_prompt_length], dtype='int64')}
         for i, samp in enumerate(samples):
             self._process_lm(i, samp, model_data, no_model_data, gen_data)
         return model_data, no_model_data, gen_data
 
 
 def get_teacher_model(teacher_model_path):
-    config = AutoConfig.from_pretrained(teacher_model_path)
-    model = AutoModelForCausalLM.from_pretrained(teacher_model_path, config
-        =config, torch_dtype=torch.float16)
+    config = paddlenlp.transformers.PretrainedConfig(name_or_path=
+        teacher_model_path)
+    model = paddlenlp.transformers.PretrainedModel(teacher_model_path,
+        config=config)
     model.eval()
     return model
 
@@ -290,22 +284,22 @@ def get_optimizer(model):
         [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
         'weight_decay': 0.0}]
     param_groups = optimizer_grouped_parameters
-    optimizer = paddle.optimizer.AdamW(learning_rate=0.0005, parameters=\
-        param_groups, weight_decay=0.01)
+    optimizer = paddle.optimizer.AdamW(parameters=param_groups,
+        learning_rate=0.0005, weight_decay=0.01)
     return optimizer
 
 
 def get_learning_rate_scheduler(total_iters, optimizer):
-    lr_scheduler = CosineAnnealingDecay(T_max=total_iters, eta_min=0.0001,
-        learning_rate=0.01)
-    optimizer._learning_rate = lr_scheduler
+    tmp_lr = paddle.optimizer.lr.CosineAnnealingDecay(T_max=total_iters,
+        eta_min=0.0001, learning_rate=optimizer.get_lr())
+    optimizer.set_lr_scheduler(tmp_lr)
+    lr_scheduler = tmp_lr
     return lr_scheduler
 
 
 def setup_model_and_optimizer(model_path, total_iters):
-    config = AutoConfig.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path, config=config,
-        torch_dtype=torch.float16)
+    config = paddlenlp.transformers.PretrainedConfig(name_or_path=model_path)
+    model = paddlenlp.transformers.PretrainedModel(model_path, config=config)
     optimizer = get_optimizer(model)
     lr_scheduler = get_learning_rate_scheduler(total_iters, optimizer)
     return model, optimizer, lr_scheduler
@@ -334,15 +328,17 @@ def get_distil_loss(tokenizer, model, teacher_model, model_batch,
         teacher_model.eval()
         teacher_outputs = teacher_model(**model_batch, use_cache=False)
         teacher_logits = teacher_outputs.logits
-    teacher_probs = F.softmax(teacher_logits, dtype=paddle.float32, axis=-1)
-    inf_mask = paddle.isinf(logits)
-    logprobs = F.log_softmax(logits, dtype=paddle.float32, axis=-1)
-    prod_probs = paddle.Tensor.masked_fill(teacher_probs * logprobs,
-        inf_mask, 0)
-    x = torch2paddle.sum(prod_probs, dim=-1).view(-1)
-    mask = (no_model_batch['label'] != -100).int()
-    distil_loss = -torch2paddle.sum(x * mask.view(-1), dim=0
-        ) / torch2paddle.sum(mask.view(-1), dim=0)
+    teacher_probs = paddle.nn.functional.softmax(x=teacher_logits, axis=-1,
+        dtype='float32')
+    inf_mask = paddle.isinf(x=logits)
+    logprobs = paddle.nn.functional.log_softmax(x=logits, axis=-1, dtype=
+        'float32')
+    prod_probs = paddle.masked_fill(x=teacher_probs * logprobs, mask=
+        inf_mask, value=0)
+    x = paddle.sum(x=prod_probs, axis=-1).view(-1)
+    mask = (no_model_batch['label'] != -100).astype(dtype='int32')
+    distil_loss = -paddle.sum(x=x * mask.view(-1), axis=0) / paddle.sum(x=
+        mask.view(-1), axis=0)
     return distil_loss
 
 
@@ -351,7 +347,7 @@ def get_intermediate_distil_loss(tokenizer, model, teacher_model,
     with paddle.no_grad():
         teacher_model.eval()
         _, _, teacher_atts = teacher_model(**model_batch, output_attentions
-            =True, output_hidden_states=True, return_dict=False, use_cache=\
+            =True, output_hidden_states=True, return_dict=False, use_cache=
             False)
         teacher_layer_num = len(teacher_atts)
         student_layer_num = len(student_atts)
@@ -380,47 +376,47 @@ def get_intermediate_distil_loss(tokenizer, model, teacher_model,
             else:
                 map_teacher_atts = map_teacher_atts.pop() + [teacher_atts[-1]]
     att_loss = 0.0
-    loss_mse = MSELoss()
+    loss_mse = paddle.nn.MSELoss()
     for student_att, teacher_att in zip(map_student_atts, map_teacher_atts):
-        student_att = paddle.where(student_att <= -100.0, paddle.full_like(
-            student_att).requires_grad_(False), student_att)
-        teacher_att = paddle.where(teacher_att <= -100.0, paddle.full_like(
-            teacher_att).requires_grad_(False), teacher_att)
+        student_att = paddle.where(condition=student_att <= -100.0, x=
+            paddle.zeros_like(x=student_att), y=student_att)
+        teacher_att = paddle.where(condition=teacher_att <= -100.0, x=
+            paddle.zeros_like(x=teacher_att), y=teacher_att)
         att_loss += loss_mse(student_att, attn_map_network(teacher_att.
-            permute(0, 3, 2, 1)).permute(0, 3, 2, 1))
+            transpose(perm=[0, 3, 2, 1])).transpose(perm=[0, 3, 2, 1]))
     mid_loss = att_loss
     return mid_loss
 
 
 def get_teacher_lm_loss(tokenizer, model, teacher_model, model_batch):
     with paddle.no_grad():
-        t_gen_out = teacher_model.generate(**model_batch, pad_token_id=\
+        t_gen_out = teacher_model.generate(**model_batch, pad_token_id=
             tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
-            max_length=512, top_k=0, top_p=1, temperature=1.0, do_sample=\
+            max_length=512, top_k=0, top_p=1, temperature=1.0, do_sample=
             True, return_dict_in_generate=True, output_scores=False)
     full_ids = t_gen_out.sequences
     input_ids = full_ids[:, :-1]
-    mask = (input_ids != tokenizer.pad_token_id).long()
+    mask = (input_ids != tokenizer.pad_token_id).astype(dtype='int64')
     labels = full_ids[:, 1:]
-    labels = paddle.Tensor.masked_fill(labels, mask == 0, -100)
-    labels[:, :model_batch['input_ids'].size(1) - 1] = -100
-    loss_mask = (labels != -100).float()
+    labels = paddle.masked_fill(x=labels, mask=mask == 0, value=-100)
+    labels[:, :model_batch['input_ids'].shape[1] - 1] = -100
+    loss_mask = (labels != -100).astype(dtype='float32')
     new_batch = {'input_ids': input_ids, 'attention_mask': mask}
-    position_ids = paddle.cumsum(mask, axis=-1) - 1
-    position_ids = paddle.Tensor.masked_fill(position_ids, mask == 0, 0)
+    position_ids = paddle.cumsum(x=mask, axis=-1) - 1
+    position_ids = paddle.masked_fill(x=position_ids, mask=mask == 0, value=0)
     new_batch['position_ids'] = position_ids
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+    loss_fn = paddle.nn.CrossEntropyLoss(ignore_index=-100)
     outputs = model(**new_batch, return_dict=True, use_cache=False)
     logits = outputs.logits
-    lm_loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+    lm_loss = loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
     return lm_loss
 
 
-def finetune(tokenizer: AutoTokenizer, model, optimizer, lr_scheduler,
-    dataset, total_iters, teacher_model=None):
-    loss_func = nn.CrossEntropyLoss()
-    sampler = paddle.io.DistributedBatchSampler(dataset['train'],
-        batch_size=1, num_replicas=1, rank=0, shuffle=True, drop_last=True)
+def finetune(tokenizer: paddlenlp.transformers.PretrainedTokenizer, model,
+    optimizer, lr_scheduler, dataset, total_iters, teacher_model=None):
+    loss_func = paddle.nn.CrossEntropyLoss()
+    sampler = paddle.io.DistributedBatchSampler(dataset=dataset['train'],
+        shuffle=True, drop_last=True, rank=0, num_replicas=1, batch_size=1)
     train_dataloader = DataLoader(dataset['train'], sampler=sampler,
         batch_size=2, num_workers=4, collate_fn=dataset['train'].collate)
     step, global_step = 1, 1
@@ -428,10 +424,14 @@ def finetune(tokenizer: AutoTokenizer, model, optimizer, lr_scheduler,
         0.0, 0.0)
     teacher_attn_head_num = 25
     student_attn_head_num = 12
-    attn_map_network = nn.Linear(teacher_attn_head_num,
-        student_attn_head_num, dtype=paddle.float16)
-    attn_map_network.weight.requires_grad_(True)
-    attn_map_network.bias.requires_grad_(True)
+    attn_map_network = paddle.nn.Linear(in_features=teacher_attn_head_num,
+        out_features=student_attn_head_num)
+    out_0 = attn_map_network.weight
+    out_0.stop_gradient = not True
+    out_0
+    out_1 = attn_map_network.bias
+    out_1.stop_gradient = not True
+    out_1
     for epoch in range(10):
         sampler.set_epoch(epoch)
         model.train()
@@ -439,11 +439,11 @@ def finetune(tokenizer: AutoTokenizer, model, optimizer, lr_scheduler,
             train_dataloader):
             outputs = model(**model_batch, use_cache=False)
             logits = outputs.logits
-            _, _, student_atts = model(**model_batch, output_attentions=\
+            _, _, student_atts = model(**model_batch, output_attentions=
                 True, output_hidden_states=True, return_dict=False,
                 use_cache=False)
-            lm_loss = loss_func(logits.float().view(-1, logits.shape[-1]),
-                no_model_batch['label'].view(-1))
+            lm_loss = loss_func(logits.astype(dtype='float32').view(-1,
+                tuple(logits.shape)[-1]), no_model_batch['label'].view(-1))
             distil_loss = get_distil_loss(tokenizer, model, teacher_model,
                 model_batch, no_model_batch, logits)
             intermediate_distil_loss = get_intermediate_distil_loss(tokenizer,
@@ -451,8 +451,8 @@ def finetune(tokenizer: AutoTokenizer, model, optimizer, lr_scheduler,
                 student_atts, attn_map_network)
             loss = 0.9 * (0.5 * lm_loss + 0.5 * distil_loss
                 ) + 0.1 * intermediate_distil_loss
-            model.backward(loss)
-            model.step()
+            loss.backward()
+            optimizer.step()
             global_loss = loss.item()
             global_distil_loss = 0
             global_intermediate_distil_loss = 0
@@ -481,7 +481,7 @@ def finetune(tokenizer: AutoTokenizer, model, optimizer, lr_scheduler,
                 save_dir_path = os.path.join('.', str(global_step))
                 os.makedirs(save_dir_path, exist_ok=True)
                 tokenizer.save_pretrained(save_dir_path)
-                model.module.save_pretrained(save_dir_path)
+                model.save_pretrained(save_dir_path)
             model.train()
             step += 1
             if step % 1 == 0:
@@ -492,8 +492,9 @@ def finetune(tokenizer: AutoTokenizer, model, optimizer, lr_scheduler,
 
 
 def main():
-    model_path = '../minillm/checkpoint/gpt2-base'
-    teacher_model_path = '../minillm/result/gpt2-xlarge'
+    True = False
+    model_path = '../minillm/checkpoints/gpt2-base'
+    teacher_model_path = '../minillm/results/gpt2/train/sft/gpt2-xlarge'
     data_dir = '../minillm/processed_data/dolly/full/gpt2/'
     do_train = True
     do_eval = False
@@ -501,7 +502,7 @@ def main():
     dp_world_size = 8
     gradient_accumulation_steps = 1
     epochs = 10
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = transformers.PreTrainedTokenizer(vocab_files_names=model_path)
     tokenizer.pad_token_id = tokenizer.eos_token_id
     dataset = prepare_dataset(data_dir, do_train, do_eval, tokenizer)
     if do_train:
